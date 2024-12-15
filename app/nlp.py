@@ -4,7 +4,8 @@ import os
 from dotenv import load_dotenv
 from typing import Any
 import openai
-from db import fetch_query, get_schema
+from db import fetch_query, get_schema_from_file  # Cambié get_schema por get_schema_from_file
+import asyncio
 
 # Cargar variables de entorno desde el archivo .env
 load_dotenv()
@@ -21,7 +22,11 @@ async def human_query_to_sql(human_query: str) -> str:
     """
     try:
         # Obtener esquema de la base de datos
-        database_schema = get_schema()
+        database_schema = get_schema_from_file()  # Ahora usamos get_schema_from_file()
+
+        if not database_schema:
+            logger.error("No se pudo cargar el esquema de la base de datos.")
+            return None
 
         system_message = f"""
         Tienes el siguiente esquema de base de datos. Convierte una consulta en lenguaje natural a SQL y
@@ -34,21 +39,29 @@ async def human_query_to_sql(human_query: str) -> str:
         {database_schema}
         </esquema>
         """
-        user_message = human_query
-
-        # Realizar consulta al modelo OpenAI
-        response = openai.ChatCompletion.create(
+        # Llamada a OpenAI
+        response = await asyncio.to_thread(
+            openai.ChatCompletion.create,
             model="gpt-4",
-            messages=[
+            messages=[  # Consulta de la IA con el esquema y la consulta del usuario
                 {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message},
+                {"role": "user", "content": human_query},
             ],
         )
 
+        # Manejo robusto del JSON
         response_content = response.choices[0].message.content
-        sql_query = json.loads(response_content).get("sql_query")
+        response_data = json.loads(response_content)
+        sql_query = response_data.get("sql_query")
+        if not sql_query:
+            logger.error("La respuesta de OpenAI no contiene 'sql_query'.")
+            return None
 
         return sql_query
+
+    except json.JSONDecodeError:
+        logger.error("Error al decodificar la respuesta de OpenAI como JSON.")
+        return None
     except Exception as e:
         logger.error(f"Error al generar la consulta SQL: {e}")
         return None
@@ -67,11 +80,10 @@ async def build_answer(result: list[dict[str, Any]], human_query: str) -> str:
         {result}
         </respuesta_sql>
         """
-        response = openai.ChatCompletion.create(
+        response = await asyncio.to_thread(
+            openai.ChatCompletion.create,
             model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_message},
-            ],
+            messages=[{"role": "system", "content": system_message}],
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -90,8 +102,8 @@ async def process_user_query(human_query: str) -> str:
 
     # Ejecutar consulta en la base de datos
     results = fetch_query(sql_query)
-    if results is None:
-        return "Lo siento, hubo un problema al ejecutar la consulta SQL."
+    if not results or len(results) == 0:
+        return "No se encontraron resultados para tu consulta."
 
     # Generar respuesta humanizada
     answer = await build_answer(results, human_query)
